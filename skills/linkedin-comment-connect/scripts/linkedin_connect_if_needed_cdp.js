@@ -23,7 +23,8 @@ async function main() {
 
   const browser = await chromium.connectOverCDP(cdpUrl);
   const context = browser.contexts()[0] || (await browser.newContext());
-  const page = context.pages()[0] || (await context.newPage());
+  // Avoid reusing an existing page that may get closed by the user/browser.
+  const page = await context.newPage();
 
   const result = {
     ok: true,
@@ -37,38 +38,66 @@ async function main() {
     await page.waitForLoadState('domcontentloaded');
     await sleep(500);
 
-    // If already connected / pending / message, do nothing.
+    // If already connected/pending, do nothing.
+    // IMPORTANT: use isVisible() not count(); lots of hidden/irrelevant elements can match.
+    // Also: do NOT treat the always-present "Message" CTA as already-connected.
     const already = page
       .locator('button, a')
-      .filter({ hasText: /\bmessage\b|\bpending\b|\bin mail\b|\bconnected\b/i })
+      .filter({ hasText: /\bpending\b|\bconnected\b|\bwithdraw\b|\bremove connection\b/i })
       .first();
-    if (await already.count()) {
+    if (await already.isVisible().catch(() => false)) {
       result.reason = 'already_connected_or_pending';
       console.log(JSON.stringify(result));
       await browser.close();
       return;
     }
 
-    // If already following + Connect is not directly visible, Connect may be under the overflow (...) menu.
-    // Requirement: if it's a Follow button, don't click Follow; but we MAY still try connecting via More.
+    // 1) Prefer the *direct page* connect anchor/button inside the relationship-building component.
+    // This variant is typically an <a> without role=button.
+    const directConnect = page
+      .locator(
+        '[data-view-name="relationship-building-button"] [data-view-name="edge-creation-connect-action"] a[aria-label*="Invite"], [data-view-name="edge-creation-connect-action"] a:has-text("Connect")'
+      )
+      .first();
 
-    // If Connect is directly visible on-page, prefer that.
-    const directConnect = page.locator('[data-view-name="edge-creation-connect-action"]').first();
     if (await directConnect.isVisible().catch(() => false)) {
-      await directConnect.click({ timeout: 10000 });
-      await sleep(600);
+      const href = await directConnect.getAttribute('href').catch(() => null);
+      // If it's a link to /preload/custom-invite/, clicking can be flaky; navigate directly.
+      if (href && href.startsWith('/preload/custom-invite/')) {
+        await page.goto(`https://www.linkedin.com${href}`, {
+          waitUntil: 'domcontentloaded',
+          timeout: 60000
+        });
+        await sleep(1200);
+      } else {
+        await directConnect.click({ timeout: 10000, force: true });
+        await sleep(900);
+      }
     } else {
-      // Click overflow menu (More / ...)
-      const overflow = page.locator('[data-view-name="profile-overflow-button"] button[aria-label="More"], button[aria-label="More"], button:has-text("More")').first();
+      // 2) Otherwise, open overflow menu (More / ...) and look for a Connect menu item.
+      // Click can be blocked by pointer-event interceptors on LinkedIn; keyboard open is more reliable.
+      const overflow = page
+        .locator(
+          '[data-view-name="profile-overflow-button"] button[aria-label="More"], button[aria-label="More"], button:has-text("More")'
+        )
+        .first();
+
       if (await overflow.isVisible().catch(() => false)) {
-        await overflow.click({ timeout: 10000 });
-        await sleep(500);
+        await overflow.focus().catch(() => {});
+        await page.keyboard.press('Enter').catch(() => {});
+        await sleep(250);
+        // Fallback
+        await page.keyboard.press('Space').catch(() => {});
+        await sleep(900);
       }
 
-      // In the menu, Connect is often an <a role="menuitem"> with data-view-name edge-creation-connect-action.
-      const menuConnect = page.locator('a[role="menuitem"][data-view-name="edge-creation-connect-action"], [data-view-name="edge-creation-connect-action"] a[role="menuitem"], a[role="menuitem"]:has-text("Connect")').first();
+      const menuConnect = page
+        .locator(
+          '[data-view-name="edge-creation-connect-action"] a[role="menuitem"], a[role="menuitem"]:has(p:has-text("Connect")), a[role="menuitem"]:has-text("Connect")'
+        )
+        .first();
+
       if (!(await menuConnect.isVisible().catch(() => false))) {
-        // If Follow is present and Connect isn't in overflow, do nothing.
         const follow = page.locator('button, a').filter({ hasText: /^\s*Follow\s*$/i }).first();
         if (await follow.isVisible().catch(() => false)) {
           result.reason = 'follow_only_no_connect';
@@ -80,20 +109,55 @@ async function main() {
         return;
       }
 
-      await menuConnect.click({ timeout: 10000 });
-      await sleep(700);
+      const href = await menuConnect.getAttribute('href').catch(() => null);
+      if (href && href.startsWith('/preload/custom-invite/')) {
+        await page.goto(`https://www.linkedin.com${href}`, {
+          waitUntil: 'domcontentloaded',
+          timeout: 60000
+        });
+        await sleep(900);
+      } else {
+        await menuConnect.click({ timeout: 10000, force: true });
+        await sleep(900);
+      }
     }
 
-    // If a dialog appears with "Send" button, click it.
-    const sendBtn = page.getByRole('button', { name: /^\s*Send\s*$/i }).first();
+    // If an invite flow/dialog appears with a "Send" button, click it.
+    // LinkedIn often shows a modal with primary action "Send without a note".
+    const inviteModal = page
+      .locator('[data-test-modal-id="send-invite-modal"], #artdeco-modal-outlet [role="dialog"].send-invite')
+      .first();
+    if (await inviteModal.isVisible().catch(() => false)) {
+      const sendWithoutNote = inviteModal
+        .locator('button[aria-label="Send without a note"], button:has-text("Send without a note")')
+        .first();
+      if (await sendWithoutNote.isVisible().catch(() => false)) {
+        await sendWithoutNote.click({ timeout: 15000 });
+        await sleep(1500);
+      }
+    }
+
+    // Fallback: plain "Send" button variants.
+    const sendBtn = page.locator('button').filter({ hasText: /^\s*Send\s*$/i }).first();
     if (await sendBtn.isVisible().catch(() => false)) {
-      await sendBtn.click({ timeout: 10000 });
-      await sleep(1200);
+      await sendBtn.click({ timeout: 15000 });
+      await sleep(1500);
+    } else {
+      const sendAny = page.getByRole('button', { name: /send/i }).first();
+      if (await sendAny.isVisible().catch(() => false)) {
+        await sendAny.click({ timeout: 15000 });
+        await sleep(1500);
+      }
     }
 
-    // Confirm by presence of Pending state somewhere near actions/menu.
-    // On success, LinkedIn typically changes Connect -> Pending.
-    const pending = page.locator('button, a, p, span').filter({ hasText: /^\s*Pending\s*$/i }).first();
+    // Confirm by navigating back to the profile and checking for Pending.
+    await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await sleep(1200);
+
+    const pending = page
+      .locator('button, a, p, span')
+      .filter({ hasText: /^\s*Pending\s*$/i })
+      .first();
     if (await pending.isVisible().catch(() => false)) {
       result.connectionSent = true;
       result.reason = 'pending_confirmed';
