@@ -1,5 +1,5 @@
 {
-  "name": "openclaw-linkedin_comment_and_connect",
+  "name": "openclaw-linkedin-comment-and-connect",
   "version": "0.1.0",
   "description": "OpenClaw plugin: comment on a LinkedIn post via hybrid CDP+xdotool submit, then optionally send a connection request on a profile URL.",
   "type": "module",
